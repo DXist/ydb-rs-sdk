@@ -3,7 +3,8 @@ use std::fmt::{self, Debug};
 use std::num::ParseIntError;
 use std::str::FromStr;
 use ydb::{
-    ydb_params, ClientBuilder, Query, StaticToken, TableClient, YdbError, YdbOrCustomerError,
+    ydb_params, ClientBuilder, Query, StaticToken, TableClient, TransactionOptions, YdbError,
+    YdbOrCustomerError,
 };
 
 const USAGE: &str = "
@@ -17,6 +18,10 @@ add <id> my todo
     Adds a todo item with the provided id
 list
     Prints upto 200 todo items
+markdone <id>
+    Marks the given todo item as done
+remove <id>
+    Removes a todo item
 cleardb
     Deinitializes todo list database
 ";
@@ -52,8 +57,8 @@ impl Debug for TodoListError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Usage => write!(f, "{}", USAGE),
-            Self::Ydb(ydb_err) => write!(f, "{}", ydb_err),
-            Self::YdbOrCustomer(ydb_err) => write!(f, "{}", ydb_err),
+            Self::Ydb(ydb_err) => write!(f, "{:#}", ydb_err),
+            Self::YdbOrCustomer(ydb_err) => write!(f, "{:#}", ydb_err),
             Self::IdRequired => write!(f, "argument id is required"),
             Self::ParseInt(err) => write!(f, "id is a nonnegative integer: {}", err),
             Self::TextRequired => write!(f, "argument text is required"),
@@ -73,29 +78,30 @@ async fn main() -> Result<(), TodoListError> {
     // wait until the background initialization of the driver finishes
     client.wait().await?;
 
+    // Single query transactions are not interactive and commit implicitly
+    let mut table_client = client
+        .table_client()
+        .clone_with_transaction_options(TransactionOptions::new().with_autocommit(true));
+
     let mut args = env::args().skip(1);
     let cmd = args.next().ok_or_else(|| TodoListError::Usage)?;
 
     match cmd.as_str() {
         "add" => {
             let todo = parse_add(args)?;
-            let mut table_client = client.table_client(); // create table client
             add_todo(&mut table_client, todo).await?;
         }
-        "list" => {
-            let mut table_client = client.table_client(); // create table client
-            list(&mut table_client).await?
+        "list" => list(&mut table_client).await?,
+        "markdone" => {
+            let id = parse_id(&mut args)?;
+            mark_done(&mut table_client, id).await?;
         }
-        "initdb" => {
-            let mut table_client = client.table_client(); // create table client
-            init_db(&mut table_client).await?
+        "remove" => {
+            let id = parse_id(&mut args)?;
+            remove(&mut table_client, id).await?;
         }
-        "cleardb" => {
-            let mut table_client = client.table_client(); // create table client
-            clear_db(&mut table_client).await?
-        }
-        // "done" => println!("done"),
-        // "delete" => println!("delete"),
+        "initdb" => init_db(&mut table_client).await?,
+        "cleardb" => clear_db(&mut table_client).await?,
         _ => {
             eprintln!("{}", USAGE);
             std::process::exit(1);
@@ -115,8 +121,8 @@ fn parse_add<I>(mut args: I) -> Result<TodoItem, TodoListError>
 where
     I: Iterator<Item = String> + ExactSizeIterator,
 {
-    let id_raw = args.next().ok_or_else(|| TodoListError::IdRequired)?;
-    let id = id_raw.parse::<u64>()?;
+    let id = parse_id(&mut args)?;
+
     if args.len() == 0 {
         return Err(TodoListError::TextRequired);
     }
@@ -148,7 +154,6 @@ async fn add_todo(table_client: &mut TableClient, todo: TodoItem) -> Result<(), 
                 .with_params(ydb_params!("$id" => todo.id, "$text" => text)),
             )
             .await?;
-            tx.commit().await?;
             Ok(())
         })
         .await?;
@@ -190,6 +195,59 @@ async fn list(table_client: &mut TableClient) -> Result<(), TodoListError> {
                     done.expect("not null")
                 );
             }
+            Ok(())
+        })
+        .await?;
+    Ok(())
+}
+
+fn parse_id<I>(args: &mut I) -> Result<u64, TodoListError>
+where
+    I: Iterator<Item = String>,
+{
+    let id_raw = args.next().ok_or_else(|| TodoListError::IdRequired)?;
+    let id = id_raw.parse::<u64>()?;
+    Ok(id)
+}
+
+async fn mark_done(table_client: &mut TableClient, item_id: u64) -> Result<(), TodoListError> {
+    table_client
+        .retry_transaction(|mut tx| async move {
+            // the code in transaction can retry a few times if there was a retriable error
+            tx.query(
+                ydb::Query::from(
+                    "
+                    DECLARE $id as UInt64;
+
+                    UPDATE todo_items
+                    SET done = true
+                    WHERE id = $id;
+                ",
+                )
+                .with_params(ydb_params!("$id" => item_id)),
+            )
+            .await?;
+            Ok(())
+        })
+        .await?;
+    Ok(())
+}
+
+async fn remove(table_client: &mut TableClient, item_id: u64) -> Result<(), TodoListError> {
+    table_client
+        .retry_transaction(|mut tx| async move {
+            // the code in transaction can retry a few times if there was a retriable error
+            tx.query(
+                ydb::Query::from(
+                    "
+                    DECLARE $id as UInt64;
+
+                    DELETE FROM todo_items WHERE id = $id;
+                ",
+                )
+                .with_params(ydb_params!("$id" => item_id)),
+            )
+            .await?;
             Ok(())
         })
         .await?;

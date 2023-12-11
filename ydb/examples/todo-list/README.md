@@ -13,3 +13,15 @@ cargo run -p todo-list add 1 my todo item
 # List todo items
 
 cargo run -p todo-list list
+
+# Mark a todo item as done
+
+cargo run -p todo-list markdone 1
+
+# Remove a todo item
+
+cargo run -p todo-list remove 1
+
+# Clear todo list database
+
+cargo run -p todo-list cleardb
